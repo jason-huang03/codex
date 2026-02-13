@@ -37,6 +37,7 @@ pub enum SlashCommand {
     Statusline,
     Mcp,
     Apps,
+    Tg,
     Logout,
     Quit,
     Exit,
@@ -88,6 +89,7 @@ impl SlashCommand {
             SlashCommand::Experimental => "toggle experimental features",
             SlashCommand::Mcp => "list configured MCP tools",
             SlashCommand::Apps => "manage apps",
+            SlashCommand::Tg => "set up Telegram notifications for this session",
             SlashCommand::Logout => "log out of Codex",
             SlashCommand::Rollout => "print the rollout file path",
             SlashCommand::TestApproval => "test approval request",
@@ -138,6 +140,7 @@ impl SlashCommand {
             | SlashCommand::Clean
             | SlashCommand::Mcp
             | SlashCommand::Apps
+            | SlashCommand::Tg
             | SlashCommand::Feedback
             | SlashCommand::Quit
             | SlashCommand::Exit => true,

@@ -1,4 +1,5 @@
 use crate::bottom_pane::ApprovalRequest;
+use crate::bottom_pane::ExternalApprovalAction;
 use crate::render::renderable::Renderable;
 use codex_protocol::request_user_input::RequestUserInputEvent;
 use crossterm::event::KeyEvent;
@@ -70,5 +71,20 @@ pub(crate) trait BottomPaneView: Renderable {
         request: RequestUserInputEvent,
     ) -> Option<RequestUserInputEvent> {
         Some(request)
+    }
+
+    /// Try to apply an externally provided approval action.
+    fn try_apply_external_approval_action(&mut self, _action: ExternalApprovalAction) -> bool {
+        false
+    }
+
+    /// Returns a prompt string when this view supports secure external text input.
+    fn external_text_input_prompt(&self) -> Option<String> {
+        None
+    }
+
+    /// Try to apply externally provided text input.
+    fn try_apply_external_text_input(&mut self, _text: &str) -> bool {
+        false
     }
 }

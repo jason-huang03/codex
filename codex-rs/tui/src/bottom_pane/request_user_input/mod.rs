@@ -197,6 +197,22 @@ impl RequestUserInputOverlay {
         self.request.questions.len()
     }
 
+    fn supports_external_text_input(&self) -> bool {
+        if self.confirm_unanswered_active() || self.question_count() != 1 {
+            return false;
+        }
+        let Some(question) = self.current_question() else {
+            return false;
+        };
+        if question.is_secret {
+            return false;
+        }
+        question
+            .options
+            .as_ref()
+            .is_none_or(std::vec::Vec::is_empty)
+    }
+
     fn has_options(&self) -> bool {
         self.current_question()
             .and_then(|question| question.options.as_ref())
@@ -1273,12 +1289,42 @@ impl BottomPaneView for RequestUserInputOverlay {
         self.queue.push_back(request);
         None
     }
+
+    fn external_text_input_prompt(&self) -> Option<String> {
+        if !self.supports_external_text_input() {
+            return None;
+        }
+        self.current_question()
+            .map(|question| question.question.clone())
+    }
+
+    fn try_apply_external_text_input(&mut self, text: &str) -> bool {
+        if !self.supports_external_text_input() {
+            return false;
+        }
+
+        let text = text.trim();
+        if text.is_empty() {
+            return false;
+        }
+
+        let Some(answer) = self.current_answer_mut() else {
+            return false;
+        };
+        answer.answer_committed = true;
+        answer.notes_visible = true;
+        self.pending_submission_draft = None;
+        self.apply_submission_to_draft(text.to_string(), Vec::new());
+        self.go_next_or_submit();
+        true
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::app_event::AppEvent;
+    use crate::bottom_pane::bottom_pane_view::BottomPaneView;
     use crate::bottom_pane::selection_popup_common::menu_surface_inset;
     use crate::render::renderable::Renderable;
     use codex_protocol::request_user_input::RequestUserInputQuestion;
@@ -2895,6 +2941,64 @@ mod tests {
             "request_user_input_unanswered_confirmation",
             render_snapshot(&overlay, area)
         );
+    }
+
+    #[test]
+    fn external_text_input_prompt_is_available_for_single_freeform_question() {
+        let (tx, _rx) = test_sender();
+        let overlay = RequestUserInputOverlay::new(
+            request_event("turn-1", vec![question_without_options("q1", "Goal")]),
+            tx,
+            true,
+            false,
+            false,
+        );
+
+        assert_eq!(
+            overlay.external_text_input_prompt(),
+            Some("Share details.".to_string())
+        );
+    }
+
+    #[test]
+    fn external_text_input_submits_single_freeform_question() {
+        let (tx, mut rx) = test_sender();
+        let mut overlay = RequestUserInputOverlay::new(
+            request_event("turn-1", vec![question_without_options("q1", "Goal")]),
+            tx,
+            true,
+            false,
+            false,
+        );
+
+        assert!(overlay.try_apply_external_text_input("Answer from Telegram"));
+
+        let event = rx.try_recv().expect("expected AppEvent");
+        let AppEvent::CodexOp(Op::UserInputAnswer { response, .. }) = event else {
+            panic!("expected UserInputAnswer");
+        };
+        let answer = response.answers.get("q1").expect("answer missing");
+        assert_eq!(
+            answer,
+            &RequestUserInputAnswer {
+                answers: vec!["user_note: Answer from Telegram".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn external_text_input_is_rejected_for_option_questions() {
+        let (tx, mut rx) = test_sender();
+        let mut overlay = RequestUserInputOverlay::new(
+            request_event("turn-1", vec![question_with_options("q1", "Pick one")]),
+            tx,
+            true,
+            false,
+            false,
+        );
+
+        assert!(!overlay.try_apply_external_text_input("Answer from Telegram"));
+        assert!(rx.try_recv().is_err(), "expected no AppEvent");
     }
 
     #[test]

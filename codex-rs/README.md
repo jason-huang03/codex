@@ -48,6 +48,44 @@ Use `codex mcp` to add/list/get/remove MCP server launchers defined in `config.t
 
 You can enable notifications by configuring a script that is run whenever the agent finishes a turn. The [notify documentation](../docs/config.md#notify) includes a detailed example that explains how to get desktop notifications via [terminal-notifier](https://github.com/julienXX/terminal-notifier) on macOS. When Codex detects that it is running under WSL 2 inside Windows Terminal (`WT_SESSION` is set), the TUI automatically falls back to native Windows toast notifications so approval prompts and completed turns surface even though Windows Terminal does not implement OSC 9.
 
+The TUI also supports session-scoped Telegram notifications via `/tg`. Define bot profiles in `~/.codex/telegram-bots.toml` and pick one in each session:
+
+```toml
+[[bots]]
+name = "my-bot"
+token = "<telegram-bot-token>"
+chat_id = "<telegram-chat-id>"
+```
+
+Selection is not persisted across resumes, and each bot profile is locked to one active Codex session at a time.
+
+When a choice-only approval is pending, Codex also writes a session-local decision file so you can resolve from the terminal:
+
+```shell
+codex decision list <SESSION_ID>
+codex decision choose <SESSION_ID> <CHOICE>
+```
+
+If Telegram is enabled for the session, Codex sends a secure one-time token and accepts only strict commands in the configured chat:
+
+```text
+/cx <TOKEN> <CHOICE>
+```
+
+`CHOICE` is one of the raw choice names Codex sends as separate Telegram messages (for example `approve`, `approve_always`, `deny`).
+Only the current head decision is accepted; stale, malformed, or mismatched commands are ignored.
+
+When Codex is explicitly waiting for user text input, Telegram can also reply with:
+
+```text
+/cxi <TOKEN> <TEXT>
+```
+
+`TEXT` is submitted only for the currently active token-bound prompt. Malformed, stale, or mismatched
+commands are ignored.
+When a turn completes and Codex is idle, it also sends a `/cxi <TOKEN> ...` template so you can
+start the next prompt directly from Telegram.
+
 ### `codex exec` to run Codex programmatically/non-interactively
 
 To run Codex non-interactively, run `codex exec PROMPT` (you can also pass the prompt via `stdin`) and Codex will work on your task until it decides that it is done and exits. Output is printed to the terminal directly. You can set the `RUST_LOG` environment variable to see more about what's going on.

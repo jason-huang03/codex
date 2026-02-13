@@ -47,6 +47,27 @@ pub(crate) struct ConnectorsSnapshot {
     pub(crate) connectors: Vec<AppInfo>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ExternalDecisionSource {
+    CommandLine,
+    Telegram { user_id: i64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExternalDecisionInput {
+    pub(crate) decision_id: Option<String>,
+    pub(crate) token: String,
+    pub(crate) choice: String,
+    pub(crate) source: ExternalDecisionSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExternalPromptInput {
+    pub(crate) token: String,
+    pub(crate) text: String,
+    pub(crate) source: ExternalDecisionSource,
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub(crate) enum AppEvent {
@@ -289,6 +310,20 @@ pub(crate) enum AppEvent {
 
     /// Re-open the permissions presets popup.
     OpenPermissionsPopup,
+
+    /// Enable Telegram notifications for this session using a selected bot profile.
+    SelectTelegramBot {
+        name: String,
+    },
+
+    /// Disable Telegram notifications for this session.
+    DisableTelegramNotifications,
+
+    /// Apply a choice-only approval decision coming from Telegram or command line.
+    ExternalDecisionInput(ExternalDecisionInput),
+
+    /// Apply a token-bound freeform text input coming from Telegram.
+    ExternalPromptInput(ExternalPromptInput),
 
     /// Open the branch picker option from the review popup.
     OpenReviewBranchPicker(PathBuf),

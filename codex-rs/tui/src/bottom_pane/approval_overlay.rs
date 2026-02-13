@@ -57,6 +57,18 @@ pub(crate) enum ApprovalRequest {
     },
 }
 
+/// External choice-only action used by Telegram and command-line control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExternalApprovalAction {
+    Approve,
+    ApproveAlways,
+    ApproveForSession,
+    Deny,
+    Accept,
+    Decline,
+    Cancel,
+}
+
 /// Modal overlay asking the user to approve or deny one or more requests.
 pub(crate) struct ApprovalOverlay {
     current_request: Option<ApprovalRequest>,
@@ -259,6 +271,93 @@ impl ApprovalOverlay {
             }
         }
     }
+
+    fn apply_external_action(&mut self, action: ExternalApprovalAction) -> bool {
+        if self.current_complete {
+            return false;
+        }
+        let Some(variant) = self.current_variant.as_ref() else {
+            return false;
+        };
+
+        match (variant, action) {
+            (ApprovalVariant::Exec { id, command, .. }, ExternalApprovalAction::Approve) => {
+                self.handle_exec_decision(id, command, ReviewDecision::Approved);
+            }
+            (
+                ApprovalVariant::Exec {
+                    id,
+                    command,
+                    proposed_execpolicy_amendment: Some(proposed_execpolicy_amendment),
+                },
+                ExternalApprovalAction::ApproveAlways,
+            ) => {
+                self.handle_exec_decision(
+                    id,
+                    command,
+                    ReviewDecision::ApprovedExecpolicyAmendment {
+                        proposed_execpolicy_amendment: proposed_execpolicy_amendment.clone(),
+                    },
+                );
+            }
+            (ApprovalVariant::Exec { id, command, .. }, ExternalApprovalAction::Deny) => {
+                self.handle_exec_decision(id, command, ReviewDecision::Abort);
+            }
+            (ApprovalVariant::ApplyPatch { id, .. }, ExternalApprovalAction::Approve) => {
+                self.handle_patch_decision(id, ReviewDecision::Approved);
+            }
+            (ApprovalVariant::ApplyPatch { id, .. }, ExternalApprovalAction::ApproveForSession) => {
+                self.handle_patch_decision(id, ReviewDecision::ApprovedForSession);
+            }
+            (ApprovalVariant::ApplyPatch { id, .. }, ExternalApprovalAction::Deny) => {
+                self.handle_patch_decision(id, ReviewDecision::Abort);
+            }
+            (
+                ApprovalVariant::McpElicitation {
+                    server_name,
+                    request_id,
+                },
+                ExternalApprovalAction::Accept,
+            ) => {
+                self.handle_elicitation_decision(
+                    server_name,
+                    request_id,
+                    ElicitationAction::Accept,
+                );
+            }
+            (
+                ApprovalVariant::McpElicitation {
+                    server_name,
+                    request_id,
+                },
+                ExternalApprovalAction::Decline,
+            ) => {
+                self.handle_elicitation_decision(
+                    server_name,
+                    request_id,
+                    ElicitationAction::Decline,
+                );
+            }
+            (
+                ApprovalVariant::McpElicitation {
+                    server_name,
+                    request_id,
+                },
+                ExternalApprovalAction::Cancel,
+            ) => {
+                self.handle_elicitation_decision(
+                    server_name,
+                    request_id,
+                    ElicitationAction::Cancel,
+                );
+            }
+            _ => return false,
+        }
+
+        self.current_complete = true;
+        self.advance_queue();
+        true
+    }
 }
 
 impl BottomPaneView for ApprovalOverlay {
@@ -313,6 +412,10 @@ impl BottomPaneView for ApprovalOverlay {
     ) -> Option<ApprovalRequest> {
         self.enqueue_request(request);
         None
+    }
+
+    fn try_apply_external_approval_action(&mut self, action: ExternalApprovalAction) -> bool {
+        self.apply_external_action(action)
     }
 }
 

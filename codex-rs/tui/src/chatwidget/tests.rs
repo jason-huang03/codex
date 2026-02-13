@@ -1055,6 +1055,7 @@ async fn make_chatwidget_manual(
         },
     };
     let current_collaboration_mode = base_mode;
+    let telegram_notifier = crate::telegram::TelegramNotifier::new(cfg.codex_home.clone());
     let mut widget = ChatWidget {
         app_event_tx,
         codex_op_tx: op_tx,
@@ -1104,6 +1105,13 @@ async fn make_chatwidget_manual(
         queued_user_messages: VecDeque::new(),
         suppress_session_configured_redraw: false,
         pending_notification: None,
+        telegram_notifier,
+        external_decision_queue: decision_control::DecisionQueue::default(),
+        cli_decision_poller: None,
+        telegram_decision_poller: None,
+        last_announced_decision_token: None,
+        pending_external_prompt: None,
+        last_announced_external_prompt_token: None,
         quit_shortcut_expires_at: None,
         quit_shortcut_key: None,
         is_review_mode: false,
@@ -5899,6 +5907,69 @@ async fn runtime_metrics_websocket_timing_logs_and_final_separator_sums_totals()
     let final_separator = final_separator.expect("expected final separator with runtime metrics");
     assert!(final_separator.contains("TTFT: 80ms (iapi)"));
     assert!(final_separator.contains("TBT: 50ms (service)"));
+}
+
+#[tokio::test]
+async fn task_complete_arms_external_prompt_for_idle_composer() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.on_task_started();
+    chat.on_task_complete(None, false);
+
+    let pending = chat
+        .pending_external_prompt
+        .as_ref()
+        .expect("expected pending external prompt");
+    assert_eq!(pending.target, ExternalPromptTarget::Composer);
+    assert_eq!(pending.prompt, "Reply to continue this conversation.");
+    assert_eq!(pending.token.len(), 12);
+
+    let message = chat.telegram_prompt_request_message(pending);
+    assert!(
+        message.contains(&format!("/cxi {} to reply", pending.token)),
+        "expected reply template in message, got: {message}"
+    );
+}
+
+#[tokio::test]
+async fn task_complete_replay_does_not_arm_external_prompt() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.on_task_started();
+    chat.on_task_complete(None, true);
+
+    assert!(
+        chat.pending_external_prompt.is_none(),
+        "expected no pending external prompt for replay completion"
+    );
+}
+
+#[tokio::test]
+async fn mcp_startup_complete_arms_external_prompt_after_deferred_task_complete() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.on_task_started();
+    chat.on_mcp_startup_update(McpStartupUpdateEvent {
+        server: "atlas".to_string(),
+        status: McpStartupStatus::Starting,
+    });
+    chat.on_task_complete(None, false);
+    assert!(
+        chat.pending_external_prompt.is_none(),
+        "expected prompt to be deferred while MCP startup is still running"
+    );
+
+    chat.on_mcp_startup_complete(McpStartupCompleteEvent {
+        ready: Vec::new(),
+        failed: Vec::new(),
+        cancelled: Vec::new(),
+    });
+    let pending = chat
+        .pending_external_prompt
+        .as_ref()
+        .expect("expected pending external prompt after MCP startup completed");
+    assert_eq!(pending.target, ExternalPromptTarget::Composer);
+    assert_eq!(pending.prompt, "Reply to continue this conversation.");
 }
 
 #[tokio::test]

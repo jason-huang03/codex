@@ -27,7 +27,15 @@ use codex_tui::ExitReason;
 use codex_tui::update_action::UpdateAction;
 use codex_utils_cli::CliConfigOverrides;
 use owo_colors::OwoColorize;
+use serde::Deserialize;
+use serde::Serialize;
+use std::fs::OpenOptions;
 use std::io::IsTerminal;
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use supports_color::Stream;
 
@@ -132,6 +140,9 @@ enum Subcommand {
     /// [EXPERIMENTAL] Browse tasks from Codex Cloud and apply changes locally.
     #[clap(name = "cloud", alias = "cloud-tasks")]
     Cloud(CloudTasksCli),
+
+    /// Resolve pending in-session approval decisions from the command line.
+    Decision(DecisionCommand),
 
     /// Internal: run the responses API proxy.
     #[clap(hide = true)]
@@ -376,6 +387,37 @@ struct StdioToUdsCommand {
     socket_path: PathBuf,
 }
 
+#[derive(Debug, Parser)]
+struct DecisionCommand {
+    #[command(subcommand)]
+    subcommand: DecisionSubcommand,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum DecisionSubcommand {
+    /// Print the currently pending decision for a session.
+    List(DecisionListCommand),
+    /// Submit a choice for the currently pending decision.
+    Choose(DecisionChooseCommand),
+}
+
+#[derive(Debug, Parser)]
+struct DecisionListCommand {
+    /// Session/thread id (UUID) shown in /status.
+    #[arg(value_name = "SESSION_ID")]
+    session_id: String,
+}
+
+#[derive(Debug, Parser)]
+struct DecisionChooseCommand {
+    /// Session/thread id (UUID) shown in /status.
+    #[arg(value_name = "SESSION_ID")]
+    session_id: String,
+    /// One of the choices shown in `codex decision list`.
+    #[arg(value_name = "CHOICE")]
+    choice: String,
+}
+
 fn format_exit_messages(exit_info: AppExitInfo, color_enabled: bool) -> Vec<String> {
     let AppExitInfo {
         token_usage,
@@ -529,6 +571,143 @@ enum FeaturesSubcommand {
 struct FeatureSetArgs {
     /// Feature key to update (for example: unified_exec).
     feature: String,
+}
+
+const DECISION_CONTROL_DIRNAME: &str = "decision-control";
+const PENDING_FILE_SUFFIX: &str = ".pending.json";
+const CHOOSE_FILE_SUFFIX: &str = ".choose.json";
+const DECISION_FILE_VERSION: u32 = 1;
+
+#[derive(Debug, Deserialize)]
+struct PendingDecisionFile {
+    version: u32,
+    session_id: String,
+    decision_id: String,
+    token: String,
+    summary: String,
+    choices: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DecisionChoiceFile {
+    version: u32,
+    session_id: String,
+    decision_id: String,
+    token: String,
+    choice: String,
+}
+
+fn decision_control_dir(codex_home: &std::path::Path) -> PathBuf {
+    codex_home.join(DECISION_CONTROL_DIRNAME)
+}
+
+fn pending_decision_path(codex_home: &std::path::Path, session_id: &str) -> PathBuf {
+    decision_control_dir(codex_home).join(format!("{session_id}{PENDING_FILE_SUFFIX}"))
+}
+
+fn choose_decision_path(codex_home: &std::path::Path, session_id: &str) -> PathBuf {
+    decision_control_dir(codex_home).join(format!("{session_id}{CHOOSE_FILE_SUFFIX}"))
+}
+
+fn ensure_decision_control_dir(path: &std::path::Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+fn read_pending_decision(
+    codex_home: &std::path::Path,
+    session_id: &str,
+) -> anyhow::Result<PendingDecisionFile> {
+    let path = pending_decision_path(codex_home, session_id);
+    let contents = std::fs::read_to_string(&path).map_err(|err| {
+        anyhow::anyhow!(
+            "failed to read pending decision file {}: {err}",
+            path.display()
+        )
+    })?;
+    let pending: PendingDecisionFile = serde_json::from_str(&contents).map_err(|err| {
+        anyhow::anyhow!(
+            "failed to parse pending decision file {}: {err}",
+            path.display()
+        )
+    })?;
+    if pending.version != DECISION_FILE_VERSION {
+        anyhow::bail!(
+            "unsupported decision file version {} in {}",
+            pending.version,
+            path.display()
+        );
+    }
+    Ok(pending)
+}
+
+fn write_json_atomically<T: Serialize>(path: &std::path::Path, value: &T) -> anyhow::Result<()> {
+    let payload = serde_json::to_vec(value)?;
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let temp_path = path.with_extension(format!("{unique}.tmp"));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temp_path)?;
+    file.write_all(&payload)?;
+    file.sync_all()?;
+    std::fs::rename(temp_path, path)?;
+    Ok(())
+}
+
+fn run_decision_command(cmd: DecisionCommand) -> anyhow::Result<()> {
+    let codex_home = find_codex_home()?;
+    match cmd.subcommand {
+        DecisionSubcommand::List(args) => {
+            let path = pending_decision_path(&codex_home, &args.session_id);
+            if !path.exists() {
+                println!("No pending decision for session {}.", args.session_id);
+                return Ok(());
+            }
+            let pending = read_pending_decision(&codex_home, &args.session_id)?;
+            println!("Session: {}", pending.session_id);
+            println!("Decision: {}", pending.decision_id);
+            println!("Summary: {}", pending.summary);
+            println!("Choices: {}", pending.choices.join(", "));
+            println!("Token: {}", pending.token);
+            Ok(())
+        }
+        DecisionSubcommand::Choose(args) => {
+            let pending = read_pending_decision(&codex_home, &args.session_id)?;
+            let choice = args.choice.trim().to_ascii_lowercase();
+            if !pending.choices.iter().any(|allowed| allowed == &choice) {
+                anyhow::bail!(
+                    "invalid choice `{}`; allowed choices: {}",
+                    args.choice,
+                    pending.choices.join(", ")
+                );
+            }
+            let dir = decision_control_dir(&codex_home);
+            ensure_decision_control_dir(&dir)?;
+            let submission = DecisionChoiceFile {
+                version: DECISION_FILE_VERSION,
+                session_id: pending.session_id,
+                decision_id: pending.decision_id,
+                token: pending.token,
+                choice,
+            };
+            let choose_path = choose_decision_path(&codex_home, &args.session_id);
+            write_json_atomically(&choose_path, &submission)?;
+            println!(
+                "Submitted `{}` for decision {}.",
+                submission.choice, submission.decision_id
+            );
+            Ok(())
+        }
+    }
 }
 
 fn stage_str(stage: codex_core::features::Stage) -> &'static str {
@@ -709,6 +888,9 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
                 root_config_overrides.clone(),
             );
             codex_cloud_tasks::run_main(cloud_cli, codex_linux_sandbox_exe).await?;
+        }
+        Some(Subcommand::Decision(cmd)) => {
+            run_decision_command(cmd)?;
         }
         Some(Subcommand::Sandbox(sandbox_args)) => match sandbox_args.cmd {
             SandboxCommand::Macos(mut seatbelt_cli) => {
@@ -1434,5 +1616,38 @@ mod tests {
             .to_overrides()
             .expect_err("feature should be rejected");
         assert_eq!(err.to_string(), "Unknown feature flag: does_not_exist");
+    }
+
+    #[test]
+    fn decision_path_helpers_use_expected_suffixes() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let pending = pending_decision_path(home.path(), "session-1");
+        let choose = choose_decision_path(home.path(), "session-1");
+        assert!(pending.display().to_string().ends_with(".pending.json"));
+        assert!(choose.display().to_string().ends_with(".choose.json"));
+    }
+
+    #[test]
+    fn read_pending_decision_parses_expected_schema() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let dir = decision_control_dir(home.path());
+        ensure_decision_control_dir(&dir).expect("create dir");
+        let path = pending_decision_path(home.path(), "session-1");
+        let payload = serde_json::json!({
+            "version": 1,
+            "session_id": "session-1",
+            "decision_id": "exec:call-1",
+            "token": "abcdef123456",
+            "summary": "Approval requested: ls",
+            "choices": ["approve", "deny"]
+        });
+        std::fs::write(&path, payload.to_string()).expect("write pending file");
+        let parsed = read_pending_decision(home.path(), "session-1").expect("parse pending file");
+        assert_eq!(parsed.session_id, "session-1");
+        assert_eq!(parsed.decision_id, "exec:call-1");
+        assert_eq!(
+            parsed.choices,
+            vec!["approve".to_string(), "deny".to_string()]
+        );
     }
 }

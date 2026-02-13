@@ -46,6 +46,7 @@ mod status_line_setup;
 pub(crate) use app_link_view::AppLinkView;
 pub(crate) use approval_overlay::ApprovalOverlay;
 pub(crate) use approval_overlay::ApprovalRequest;
+pub(crate) use approval_overlay::ExternalApprovalAction;
 pub(crate) use request_user_input::RequestUserInputOverlay;
 mod bottom_pane_view;
 
@@ -796,6 +797,48 @@ impl BottomPane {
             Some("Answer the questions to continue.".to_string()),
         );
         self.push_view(Box::new(modal));
+    }
+
+    /// Apply an externally provided approval action to the active approval modal.
+    pub(crate) fn try_apply_external_approval_action(
+        &mut self,
+        action: ExternalApprovalAction,
+    ) -> bool {
+        let Some(view) = self.view_stack.last_mut() else {
+            return false;
+        };
+        if !view.try_apply_external_approval_action(action) {
+            return false;
+        }
+        if view.is_complete() {
+            self.view_stack.clear();
+            self.on_active_view_complete();
+        }
+        self.request_redraw();
+        true
+    }
+
+    /// Returns the active external text-input prompt when available.
+    pub(crate) fn external_text_input_prompt(&self) -> Option<String> {
+        self.view_stack
+            .last()
+            .and_then(|view| view.external_text_input_prompt())
+    }
+
+    /// Apply externally provided text input to the active modal.
+    pub(crate) fn try_apply_external_text_input(&mut self, text: &str) -> bool {
+        let Some(view) = self.view_stack.last_mut() else {
+            return false;
+        };
+        if !view.try_apply_external_text_input(text) {
+            return false;
+        }
+        if view.is_complete() {
+            self.view_stack.clear();
+            self.on_active_view_complete();
+        }
+        self.request_redraw();
+        true
     }
 
     fn on_active_view_complete(&mut self) {

@@ -156,10 +156,19 @@ const PLAN_IMPLEMENTATION_YES: &str = "Yes, implement this plan";
 const PLAN_IMPLEMENTATION_NO: &str = "No, stay in Plan mode";
 const PLAN_IMPLEMENTATION_CODING_MESSAGE: &str = "Implement the plan.";
 const CONNECTORS_SELECTION_VIEW_ID: &str = "connectors-selection";
+const TELEGRAM_BOT_CONFIG_EXAMPLE: &str = concat!(
+    "[[bots]]\n",
+    "name = \"my-bot\"\n",
+    "token = \"<telegram-bot-token>\"\n",
+    "chat_id = \"<telegram-chat-id>\"\n",
+);
 
 use crate::app_event::AppEvent;
 use crate::app_event::ConnectorsSnapshot;
 use crate::app_event::ExitMode;
+use crate::app_event::ExternalDecisionInput;
+use crate::app_event::ExternalDecisionSource;
+use crate::app_event::ExternalPromptInput;
 #[cfg(target_os = "windows")]
 use crate::app_event::WindowsSandboxEnableMode;
 use crate::app_event::WindowsSandboxFallbackReason;
@@ -173,6 +182,7 @@ use crate::bottom_pane::ColumnWidthMode;
 use crate::bottom_pane::DOUBLE_PRESS_QUIT_SHORTCUT_ENABLED;
 use crate::bottom_pane::ExperimentalFeatureItem;
 use crate::bottom_pane::ExperimentalFeaturesView;
+use crate::bottom_pane::ExternalApprovalAction;
 use crate::bottom_pane::FeedbackAudience;
 use crate::bottom_pane::InputResult;
 use crate::bottom_pane::LocalImageAttachment;
@@ -209,6 +219,9 @@ use crate::render::renderable::RenderableExt;
 use crate::render::renderable::RenderableItem;
 use crate::slash_command::SlashCommand;
 use crate::status::RateLimitSnapshotDisplay;
+use crate::telegram::TelegramActivation;
+use crate::telegram::TelegramBotAvailability;
+use crate::telegram::TelegramNotifier;
 use crate::text_formatting::truncate_text;
 use crate::tui::FrameRequester;
 mod interrupts;
@@ -223,6 +236,11 @@ mod skills;
 use self::skills::collect_tool_mentions;
 use self::skills::find_app_mentions;
 use self::skills::find_skill_mentions_with_tool_mentions;
+mod decision_control;
+use self::decision_control::DecisionQueue;
+use self::decision_control::clear_session_control_files;
+use self::decision_control::spawn_cli_choice_poller;
+use self::decision_control::sync_pending_decision_file;
 use crate::mention_codec::LinkedMention;
 use crate::mention_codec::encode_history_mentions;
 use crate::streaming::chunking::AdaptiveChunkingPolicy;
@@ -561,6 +579,20 @@ pub(crate) struct ChatWidget {
     queued_user_messages: VecDeque<UserMessage>,
     // Pending notification to show when unfocused on next Draw
     pending_notification: Option<Notification>,
+    // Optional Telegram notifier selected via /tg for this session.
+    telegram_notifier: TelegramNotifier,
+    // Queue of approval decisions that can be resolved via Telegram/CLI.
+    external_decision_queue: DecisionQueue,
+    // Poller that consumes command-line decision submissions for the active session.
+    cli_decision_poller: Option<JoinHandle<()>>,
+    // Poller that consumes Telegram decision commands for the selected bot.
+    telegram_decision_poller: Option<JoinHandle<()>>,
+    // Last decision token that has already been announced to Telegram.
+    last_announced_decision_token: Option<String>,
+    // Active token-bound external text input request (Telegram).
+    pending_external_prompt: Option<PendingExternalPrompt>,
+    // Last text-input token that has already been announced to Telegram.
+    last_announced_external_prompt_token: Option<String>,
     /// When `Some`, the user has pressed a quit shortcut and the second press
     /// must occur before `quit_shortcut_expires_at`.
     quit_shortcut_expires_at: Option<Instant>,
@@ -675,6 +707,19 @@ impl From<&str> for UserMessage {
             mention_bindings: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExternalPromptTarget {
+    Composer,
+    RequestUserInput,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingExternalPrompt {
+    token: String,
+    prompt: String,
+    target: ExternalPromptTarget,
 }
 
 pub(crate) fn create_initial_user_message(
@@ -1012,6 +1057,7 @@ impl ChatWidget {
             .set_history_metadata(event.history_log_id, event.history_entry_count);
         self.set_skills(None);
         self.session_network_proxy = event.network_proxy.clone();
+        let previous_thread_id = self.thread_id;
         self.thread_id = Some(event.session_id);
         self.thread_name = event.thread_name.clone();
         self.forked_from = event.forked_from_id;
@@ -1057,6 +1103,25 @@ impl ChatWidget {
         if let Some(forked_from_id) = forked_from_id {
             self.emit_forked_thread_event(forked_from_id);
         }
+        if previous_thread_id != self.thread_id {
+            self.external_decision_queue = DecisionQueue::default();
+            self.last_announced_decision_token = None;
+            self.clear_external_prompt_state();
+            if let Some(old_id) = previous_thread_id {
+                let old_id = old_id.to_string();
+                if let Err(err) = clear_session_control_files(&self.config.codex_home, &old_id) {
+                    tracing::warn!(
+                        session_id = %old_id,
+                        error = %err,
+                        "failed to clear old decision control files"
+                    );
+                }
+            }
+            self.restart_cli_decision_poller();
+            self.restart_telegram_decision_poller();
+        }
+        self.sync_external_decision_state();
+        self.sync_external_prompt_state();
         if !self.suppress_session_configured_redraw {
             self.request_redraw();
         }
@@ -1289,6 +1354,7 @@ impl ChatWidget {
     // Raw reasoning uses the same flow as summarized reasoning
 
     fn on_task_started(&mut self) {
+        self.clear_external_prompt_state();
         self.agent_turn_running = true;
         self.saw_plan_update_this_turn = false;
         self.saw_plan_item_this_turn = false;
@@ -1370,6 +1436,16 @@ impl ChatWidget {
         });
 
         self.maybe_show_pending_rate_limit_prompt();
+        if !from_replay {
+            self.maybe_arm_external_prompt_for_idle_composer();
+        }
+    }
+
+    fn maybe_arm_external_prompt_for_idle_composer(&mut self) {
+        if self.bottom_pane.is_task_running() || !self.bottom_pane.no_modal_or_popup_active() {
+            return;
+        }
+        self.arm_external_prompt_for_composer("Reply to continue this conversation.".to_string());
     }
 
     fn maybe_prompt_plan_implementation(&mut self) {
@@ -1689,6 +1765,7 @@ impl ChatWidget {
         self.mcp_startup_status = None;
         self.update_task_running_state();
         self.maybe_send_next_queued_input();
+        self.maybe_arm_external_prompt_for_idle_composer();
         self.request_redraw();
     }
 
@@ -1711,6 +1788,14 @@ impl ChatWidget {
         if let Some(combined) = self.drain_queued_messages_for_restore() {
             self.restore_user_message_to_composer(combined);
             self.refresh_queued_user_messages();
+        }
+
+        if reason != TurnAbortReason::ReviewEnded {
+            self.arm_external_prompt_for_composer(
+                "Conversation interrupted - tell the model what to do differently.".to_string(),
+            );
+        } else {
+            self.clear_external_prompt_state();
         }
 
         self.request_redraw();
@@ -2372,9 +2457,22 @@ impl ChatWidget {
 
     pub(crate) fn handle_exec_approval_now(&mut self, ev: ExecApprovalRequestEvent) {
         self.flush_answer_stream_with_separator();
+        let allow_approve_always =
+            ev.proposed_execpolicy_amendment
+                .as_ref()
+                .is_some_and(|prefix| {
+                    let rendered_prefix = strip_bash_lc_and_escape(prefix.command());
+                    !rendered_prefix.contains('\n') && !rendered_prefix.contains('\r')
+                });
         let command = shlex::try_join(ev.command.iter().map(String::as_str))
             .unwrap_or_else(|_| ev.command.join(" "));
         self.notify(Notification::ExecApprovalRequested { command });
+        self.external_decision_queue.enqueue_exec(
+            ev.call_id.clone(),
+            ev.command.join(" "),
+            allow_approve_always,
+        );
+        self.sync_external_decision_state();
 
         let request = ApprovalRequest::Exec {
             id: ev.call_id,
@@ -2389,6 +2487,9 @@ impl ChatWidget {
 
     pub(crate) fn handle_apply_patch_approval_now(&mut self, ev: ApplyPatchApprovalRequestEvent) {
         self.flush_answer_stream_with_separator();
+        self.external_decision_queue
+            .enqueue_patch(ev.call_id.clone(), ev.changes.len());
+        self.sync_external_decision_state();
 
         let request = ApprovalRequest::ApplyPatch {
             id: ev.call_id,
@@ -2407,6 +2508,9 @@ impl ChatWidget {
 
     pub(crate) fn handle_elicitation_request_now(&mut self, ev: ElicitationRequestEvent) {
         self.flush_answer_stream_with_separator();
+        self.external_decision_queue
+            .enqueue_elicitation(ev.server_name.clone(), ev.id.clone());
+        self.sync_external_decision_state();
 
         self.notify(Notification::ElicitationRequested {
             server_name: ev.server_name.clone(),
@@ -2424,7 +2528,14 @@ impl ChatWidget {
 
     pub(crate) fn handle_request_user_input_now(&mut self, ev: RequestUserInputEvent) {
         self.flush_answer_stream_with_separator();
+        let prompt = ev
+            .questions
+            .first()
+            .map(|question| question.question.clone())
+            .unwrap_or_else(|| "User input requested".to_string());
+        self.notify(Notification::UserInputRequested { prompt });
         self.bottom_pane.push_user_input_request(ev);
+        self.sync_external_prompt_state();
         self.request_redraw();
     }
 
@@ -2559,6 +2670,7 @@ impl ChatWidget {
         let model = model.filter(|m| !m.trim().is_empty());
         let mut config = config;
         config.model = model.clone();
+        let telegram_codex_home = config.codex_home.clone();
         let mut rng = rand::rng();
         let placeholder = PLACEHOLDERS[rng.random_range(0..PLACEHOLDERS.len())].to_string();
         let codex_op_tx = spawn_agent(config.clone(), app_event_tx.clone(), thread_manager);
@@ -2645,6 +2757,13 @@ impl ChatWidget {
             show_welcome_banner: is_first_run,
             suppress_session_configured_redraw: false,
             pending_notification: None,
+            telegram_notifier: TelegramNotifier::new(telegram_codex_home),
+            external_decision_queue: DecisionQueue::default(),
+            cli_decision_poller: None,
+            telegram_decision_poller: None,
+            last_announced_decision_token: None,
+            pending_external_prompt: None,
+            last_announced_external_prompt_token: None,
             quit_shortcut_expires_at: None,
             quit_shortcut_key: None,
             is_review_mode: false,
@@ -2725,6 +2844,7 @@ impl ChatWidget {
         let model = model.filter(|m| !m.trim().is_empty());
         let mut config = config;
         config.model = model.clone();
+        let telegram_codex_home = config.codex_home.clone();
         let mut rng = rand::rng();
         let placeholder = PLACEHOLDERS[rng.random_range(0..PLACEHOLDERS.len())].to_string();
 
@@ -2814,6 +2934,13 @@ impl ChatWidget {
             show_welcome_banner: is_first_run,
             suppress_session_configured_redraw: false,
             pending_notification: None,
+            telegram_notifier: TelegramNotifier::new(telegram_codex_home),
+            external_decision_queue: DecisionQueue::default(),
+            cli_decision_poller: None,
+            telegram_decision_poller: None,
+            last_announced_decision_token: None,
+            pending_external_prompt: None,
+            last_announced_external_prompt_token: None,
             quit_shortcut_expires_at: None,
             quit_shortcut_key: None,
             is_review_mode: false,
@@ -2879,6 +3006,7 @@ impl ChatWidget {
         let model = model.filter(|m| !m.trim().is_empty());
         let mut rng = rand::rng();
         let placeholder = PLACEHOLDERS[rng.random_range(0..PLACEHOLDERS.len())].to_string();
+        let telegram_codex_home = config.codex_home.clone();
 
         let model_override = model.as_deref();
         let header_model = model
@@ -2964,6 +3092,13 @@ impl ChatWidget {
             show_welcome_banner: false,
             suppress_session_configured_redraw: true,
             pending_notification: None,
+            telegram_notifier: TelegramNotifier::new(telegram_codex_home),
+            external_decision_queue: DecisionQueue::default(),
+            cli_decision_poller: None,
+            telegram_decision_poller: None,
+            last_announced_decision_token: None,
+            pending_external_prompt: None,
+            last_announced_external_prompt_token: None,
             quit_shortcut_expires_at: None,
             quit_shortcut_key: None,
             is_review_mode: false,
@@ -3410,6 +3545,9 @@ impl ChatWidget {
             SlashCommand::Apps => {
                 self.add_connectors_output();
             }
+            SlashCommand::Tg => {
+                self.open_telegram_popup();
+            }
             SlashCommand::Rollout => {
                 if let Some(path) = self.rollout_path() {
                     self.add_info_message(
@@ -3643,6 +3781,7 @@ impl ChatWidget {
     }
 
     fn submit_user_message(&mut self, user_message: UserMessage) {
+        self.clear_external_prompt_state();
         if !self.is_session_configured() {
             tracing::warn!("cannot submit user message before session is configured; queueing");
             self.queued_user_messages.push_front(user_message);
@@ -4175,6 +4314,7 @@ impl ChatWidget {
     }
 
     fn notify(&mut self, notification: Notification) {
+        self.send_telegram_message(self.telegram_notification_message(&notification));
         if !notification.allowed_for(&self.config.tui_notifications) {
             return;
         }
@@ -4186,6 +4326,51 @@ impl ChatWidget {
         if let Some(notif) = self.pending_notification.take() {
             tui.notify(notif.display());
         }
+    }
+
+    fn telegram_notification_message(&self, notification: &Notification) -> String {
+        let thread_label = self
+            .thread_name
+            .clone()
+            .or_else(|| self.thread_id.as_ref().map(ToString::to_string));
+        if let Some(label) = thread_label {
+            format!("Codex [{label}] {}", notification.display())
+        } else {
+            format!("Codex {}", notification.display())
+        }
+    }
+
+    fn send_telegram_message(&self, text: String) -> bool {
+        let app_event_tx = self.app_event_tx.clone();
+        self.telegram_notifier.send_message(text, move || {
+            app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
+                history_cell::new_info_event("tg sent".to_string(), None),
+            )));
+        })
+    }
+
+    fn send_telegram_message_after_delay(&self, text: String, delay: Duration) -> bool {
+        let app_event_tx = self.app_event_tx.clone();
+        self.telegram_notifier
+            .send_message_after_delay(text, delay, move || {
+                app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
+                    history_cell::new_info_event("tg sent".to_string(), None),
+                )));
+            })
+    }
+
+    fn send_telegram_messages_in_order(
+        &self,
+        messages: Vec<String>,
+        delay_between_messages: Duration,
+    ) -> bool {
+        let app_event_tx = self.app_event_tx.clone();
+        self.telegram_notifier
+            .send_messages_in_order(messages, delay_between_messages, move || {
+                app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
+                    history_cell::new_info_event("tg sent".to_string(), None),
+                )));
+            })
     }
 
     /// Mark the active cell as failed (✗) and flush it into history.
@@ -6362,6 +6547,431 @@ impl ChatWidget {
         self.request_redraw();
     }
 
+    fn open_telegram_popup(&mut self) {
+        let snapshot = match self.telegram_notifier.selection_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                let config_path = self.telegram_notifier.config_path();
+                self.add_error_message(format!("Failed to load Telegram configuration: {err}"));
+                self.add_info_message(
+                    format!("Create {} and run /tg again.", config_path.display()),
+                    Some(TELEGRAM_BOT_CONFIG_EXAMPLE.to_string()),
+                );
+                return;
+            }
+        };
+
+        let active_name = snapshot
+            .active_name
+            .clone()
+            .unwrap_or_else(|| "disabled".to_string());
+        let mut header = ColumnRenderable::new();
+        header.push(Line::from("Telegram Notifications".bold()));
+        header.push(Line::from(
+            "Send turn-complete and input-needed alerts to Telegram.".dim(),
+        ));
+        header.push(Line::from(
+            format!("Config: {}", snapshot.config_path.display()).dim(),
+        ));
+        header.push(Line::from(format!("Current: {active_name}").dim()));
+
+        let mut items = Vec::with_capacity(snapshot.options.len() + 1);
+        items.push(SelectionItem {
+            name: "Disable Telegram notifications".to_string(),
+            description: Some("Stop Telegram alerts for this session.".to_string()),
+            is_current: snapshot.active_name.is_none(),
+            actions: vec![Box::new(|tx| {
+                tx.send(AppEvent::DisableTelegramNotifications);
+            })],
+            dismiss_on_select: true,
+            ..Default::default()
+        });
+
+        for option in snapshot.options {
+            let bot_name = option.name.clone();
+            let (description, selected_description, disabled_reason, is_current) =
+                match option.availability {
+                    TelegramBotAvailability::Available => (
+                        "Available".to_string(),
+                        Some("Press Enter to enable for this session.".to_string()),
+                        None,
+                        false,
+                    ),
+                    TelegramBotAvailability::InUseByAnotherSession => (
+                        "Unavailable".to_string(),
+                        Some("This bot is currently locked by another session.".to_string()),
+                        Some("In use by another session".to_string()),
+                        false,
+                    ),
+                    TelegramBotAvailability::ActiveInThisSession => (
+                        "Active in this session".to_string(),
+                        Some("Press Enter to keep using this bot.".to_string()),
+                        None,
+                        true,
+                    ),
+                };
+            let actions = if disabled_reason.is_none() {
+                vec![Box::new(move |tx: &AppEventSender| {
+                    tx.send(AppEvent::SelectTelegramBot {
+                        name: bot_name.clone(),
+                    });
+                }) as SelectionAction]
+            } else {
+                Vec::new()
+            };
+
+            items.push(SelectionItem {
+                name: option.name,
+                description: Some(description),
+                selected_description,
+                is_current,
+                actions,
+                dismiss_on_select: true,
+                disabled_reason,
+                ..Default::default()
+            });
+        }
+
+        let initial_selected_idx = items.iter().position(|item| item.is_current);
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            header: Box::new(header),
+            footer_hint: Some(standard_popup_hint_line()),
+            initial_selected_idx,
+            items,
+            ..Default::default()
+        });
+        self.request_redraw();
+    }
+
+    pub(crate) fn select_telegram_bot(&mut self, name: String) {
+        match self.telegram_notifier.select_bot(&name) {
+            Ok(TelegramActivation::Activated) => {
+                self.add_info_message(
+                    format!("Telegram notifications enabled with \"{name}\"."),
+                    Some("This selection only applies to the current session.".to_string()),
+                );
+                self.restart_telegram_decision_poller();
+                self.last_announced_decision_token = None;
+                self.sync_external_decision_state();
+                self.last_announced_external_prompt_token = None;
+                self.sync_external_prompt_state();
+            }
+            Ok(TelegramActivation::AlreadyActive) => {
+                self.add_info_message(
+                    format!("Telegram notifications are already using \"{name}\"."),
+                    None,
+                );
+                self.restart_telegram_decision_poller();
+                self.last_announced_decision_token = None;
+                self.sync_external_decision_state();
+                self.last_announced_external_prompt_token = None;
+                self.sync_external_prompt_state();
+            }
+            Err(err) => {
+                self.add_error_message(format!(
+                    "Failed to enable Telegram notifications with \"{name}\": {err}"
+                ));
+            }
+        }
+    }
+
+    pub(crate) fn disable_telegram_notifications(&mut self) {
+        if self.telegram_notifier.deactivate() {
+            self.add_info_message("Telegram notifications disabled.".to_string(), None);
+            self.stop_telegram_decision_poller();
+            self.last_announced_decision_token = None;
+            self.last_announced_external_prompt_token = None;
+        } else {
+            self.add_info_message(
+                "Telegram notifications are already disabled.".to_string(),
+                None,
+            );
+        }
+    }
+
+    pub(crate) fn handle_external_decision_input(&mut self, input: ExternalDecisionInput) {
+        let Some(action) = self.external_decision_queue.validate_external_input(&input) else {
+            tracing::warn!(
+                token = %input.token,
+                choice = %input.choice,
+                "rejected external decision input"
+            );
+            return;
+        };
+
+        if !self.bottom_pane.try_apply_external_approval_action(action) {
+            tracing::warn!(
+                token = %input.token,
+                "external decision was valid but no approval modal was active"
+            );
+            return;
+        }
+
+        self.external_decision_queue.pop_head();
+        self.last_announced_decision_token = None;
+        self.sync_external_decision_state();
+        match input.source {
+            ExternalDecisionSource::CommandLine => self.add_info_message(
+                "Applied approval decision from command line.".to_string(),
+                None,
+            ),
+            ExternalDecisionSource::Telegram { user_id } => {
+                self.add_info_message(
+                    format!("Applied approval decision from Telegram user {user_id}."),
+                    None,
+                );
+                self.send_telegram_message(self.telegram_choice_applied_message(action, user_id));
+            }
+        }
+    }
+
+    pub(crate) fn handle_external_prompt_input(&mut self, input: ExternalPromptInput) {
+        let Some(pending) = self.pending_external_prompt.clone() else {
+            tracing::warn!(
+                token = %input.token,
+                "rejected external prompt input without pending prompt"
+            );
+            return;
+        };
+        if pending.token != input.token {
+            tracing::warn!(
+                token = %input.token,
+                "rejected external prompt input with mismatched token"
+            );
+            return;
+        }
+
+        let applied = match pending.target {
+            ExternalPromptTarget::Composer => {
+                if self.bottom_pane.is_task_running()
+                    || !self.bottom_pane.no_modal_or_popup_active()
+                {
+                    false
+                } else {
+                    self.queue_user_message(input.text.clone().into());
+                    true
+                }
+            }
+            ExternalPromptTarget::RequestUserInput => {
+                self.bottom_pane.try_apply_external_text_input(&input.text)
+            }
+        };
+
+        if !applied {
+            tracing::warn!(
+                token = %input.token,
+                target = ?pending.target,
+                "external prompt input was valid but no compatible input target was active"
+            );
+            return;
+        }
+
+        self.clear_external_prompt_state();
+        self.sync_external_prompt_state();
+        match input.source {
+            ExternalDecisionSource::CommandLine => {
+                self.add_info_message("Applied text input from command line.".to_string(), None)
+            }
+            ExternalDecisionSource::Telegram { user_id } => {
+                self.add_info_message(
+                    format!("Applied text input from Telegram user {user_id}."),
+                    None,
+                );
+                self.send_telegram_message(self.telegram_prompt_applied_message(user_id));
+            }
+        }
+    }
+
+    pub(crate) fn on_codex_op_dispatched(&mut self, op: &Op) {
+        if self.external_decision_queue.resolve_from_op(op) {
+            self.last_announced_decision_token = None;
+            self.sync_external_decision_state();
+        }
+        if matches!(op, Op::Interrupt | Op::UserInputAnswer { .. }) {
+            self.clear_external_prompt_state();
+        }
+        self.sync_external_prompt_state();
+    }
+
+    fn clear_external_prompt_state(&mut self) {
+        self.pending_external_prompt = None;
+        self.last_announced_external_prompt_token = None;
+    }
+
+    fn set_pending_external_prompt(&mut self, target: ExternalPromptTarget, prompt: String) {
+        if self
+            .pending_external_prompt
+            .as_ref()
+            .is_some_and(|pending| pending.target == target && pending.prompt == prompt)
+        {
+            return;
+        }
+        self.pending_external_prompt = Some(PendingExternalPrompt {
+            token: decision_control::generate_control_token(),
+            prompt,
+            target,
+        });
+        self.last_announced_external_prompt_token = None;
+    }
+
+    fn arm_external_prompt_for_composer(&mut self, prompt: String) {
+        self.set_pending_external_prompt(ExternalPromptTarget::Composer, prompt);
+        self.sync_external_prompt_state();
+    }
+
+    fn sync_external_prompt_state(&mut self) {
+        if let Some(prompt) = self.bottom_pane.external_text_input_prompt() {
+            self.set_pending_external_prompt(ExternalPromptTarget::RequestUserInput, prompt);
+        } else if self
+            .pending_external_prompt
+            .as_ref()
+            .is_some_and(|pending| pending.target == ExternalPromptTarget::RequestUserInput)
+        {
+            self.clear_external_prompt_state();
+        }
+
+        let Some(pending) = self.pending_external_prompt.as_ref() else {
+            return;
+        };
+        if self.last_announced_external_prompt_token.as_deref() == Some(pending.token.as_str()) {
+            return;
+        }
+        if self.send_telegram_message_after_delay(
+            self.telegram_prompt_request_message(pending),
+            Duration::from_secs(2),
+        ) {
+            self.last_announced_external_prompt_token = Some(pending.token.clone());
+        }
+    }
+
+    fn sync_external_decision_state(&mut self) {
+        let Some(session_id) = self.thread_id.as_ref().map(ToString::to_string) else {
+            return;
+        };
+        if let Err(err) = sync_pending_decision_file(
+            &self.config.codex_home,
+            &session_id,
+            self.external_decision_queue.head(),
+        ) {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %err,
+                "failed to sync pending decision control files"
+            );
+        }
+
+        let Some((token, messages)) = self.external_decision_queue.head().map(|head| {
+            (
+                head.token.clone(),
+                self.telegram_decision_prompt_messages(head),
+            )
+        }) else {
+            self.last_announced_decision_token = None;
+            return;
+        };
+        if self.last_announced_decision_token.as_deref() == Some(token.as_str()) {
+            return;
+        }
+        let sent_any = self.send_telegram_messages_in_order(messages, Duration::from_secs(2));
+        if sent_any {
+            self.last_announced_decision_token = Some(token);
+        }
+    }
+
+    fn telegram_decision_prompt_messages(
+        &self,
+        decision: &decision_control::PendingDecision,
+    ) -> Vec<String> {
+        let choices = decision.choices();
+        let prefix = self
+            .thread_name
+            .clone()
+            .or_else(|| self.thread_id.as_ref().map(ToString::to_string))
+            .map(|label| format!("Codex [{label}]"))
+            .unwrap_or_else(|| "Codex".to_string());
+        let mut messages = Vec::with_capacity(choices.len() + 1);
+        messages.push(format!(
+            "{prefix} {}\nDecision id: {}\nToken: {}\nReply with one command from the next messages.",
+            decision.summary, decision.decision_id, decision.token
+        ));
+        for choice in choices {
+            messages.push(format!("/cx {} {choice}", decision.token));
+        }
+        messages
+    }
+
+    fn telegram_choice_applied_message(
+        &self,
+        action: ExternalApprovalAction,
+        user_id: i64,
+    ) -> String {
+        let choice = match action {
+            ExternalApprovalAction::Approve => "approve",
+            ExternalApprovalAction::ApproveAlways => "approve_always",
+            ExternalApprovalAction::ApproveForSession => "approve_for_session",
+            ExternalApprovalAction::Deny => "deny",
+            ExternalApprovalAction::Accept => "accept",
+            ExternalApprovalAction::Decline => "decline",
+            ExternalApprovalAction::Cancel => "cancel",
+        };
+        let prefix = self
+            .thread_name
+            .clone()
+            .or_else(|| self.thread_id.as_ref().map(ToString::to_string))
+            .map(|label| format!("Codex [{label}]"))
+            .unwrap_or_else(|| "Codex".to_string());
+        format!("{prefix} Telegram choice from user {user_id} took effect: {choice}")
+    }
+
+    fn telegram_prompt_request_message(&self, pending: &PendingExternalPrompt) -> String {
+        format!("/cxi {} to reply", pending.token)
+    }
+
+    fn telegram_prompt_applied_message(&self, user_id: i64) -> String {
+        let prefix = self
+            .thread_name
+            .clone()
+            .or_else(|| self.thread_id.as_ref().map(ToString::to_string))
+            .map(|label| format!("Codex [{label}]"))
+            .unwrap_or_else(|| "Codex".to_string());
+        format!("{prefix} Telegram text input from user {user_id} took effect.")
+    }
+
+    fn restart_cli_decision_poller(&mut self) {
+        self.stop_cli_decision_poller();
+        let Some(session_id) = self.thread_id.as_ref().map(ToString::to_string) else {
+            return;
+        };
+        self.cli_decision_poller = Some(spawn_cli_choice_poller(
+            self.config.codex_home.clone(),
+            session_id,
+            self.app_event_tx.clone(),
+        ));
+    }
+
+    fn stop_cli_decision_poller(&mut self) {
+        if let Some(handle) = self.cli_decision_poller.take() {
+            handle.abort();
+        }
+    }
+
+    fn restart_telegram_decision_poller(&mut self) {
+        self.stop_telegram_decision_poller();
+        if self.thread_id.is_none() {
+            return;
+        }
+        self.telegram_decision_poller = self
+            .telegram_notifier
+            .spawn_choice_command_poller(self.app_event_tx.clone());
+    }
+
+    fn stop_telegram_decision_poller(&mut self) {
+        if let Some(handle) = self.telegram_decision_poller.take() {
+            handle.abort();
+        }
+    }
+
     fn open_connectors_popup(&mut self, connectors: &[connectors::AppInfo]) {
         self.bottom_pane
             .show_selection_view(self.connectors_popup_params(connectors));
@@ -6970,6 +7580,17 @@ fn has_websocket_timing_metrics(summary: RuntimeMetricsSummary) -> bool {
 impl Drop for ChatWidget {
     fn drop(&mut self) {
         self.stop_rate_limit_poller();
+        self.stop_cli_decision_poller();
+        self.stop_telegram_decision_poller();
+        if let Some(session_id) = self.thread_id.as_ref().map(ToString::to_string)
+            && let Err(err) = clear_session_control_files(&self.config.codex_home, &session_id)
+        {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %err,
+                "failed to clear decision control files on drop"
+            );
+        }
     }
 }
 
@@ -6993,6 +7614,7 @@ enum Notification {
     ExecApprovalRequested { command: String },
     EditApprovalRequested { cwd: PathBuf, changes: Vec<PathBuf> },
     ElicitationRequested { server_name: String },
+    UserInputRequested { prompt: String },
 }
 
 impl Notification {
@@ -7019,6 +7641,9 @@ impl Notification {
             Notification::ElicitationRequested { server_name } => {
                 format!("Approval requested by {server_name}")
             }
+            Notification::UserInputRequested { prompt } => {
+                format!("Input requested: {}", truncate_text(prompt, 40))
+            }
         }
     }
 
@@ -7027,7 +7652,8 @@ impl Notification {
             Notification::AgentTurnComplete { .. } => "agent-turn-complete",
             Notification::ExecApprovalRequested { .. }
             | Notification::EditApprovalRequested { .. }
-            | Notification::ElicitationRequested { .. } => "approval-requested",
+            | Notification::ElicitationRequested { .. }
+            | Notification::UserInputRequested { .. } => "approval-requested",
         }
     }
 

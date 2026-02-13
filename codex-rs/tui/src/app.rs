@@ -1579,6 +1579,7 @@ impl App {
                 return Ok(AppRunControl::Exit(ExitReason::Fatal(message)));
             }
             AppEvent::CodexOp(op) => {
+                self.chat_widget.on_codex_op_dispatched(&op);
                 self.chat_widget.submit_op(op);
             }
             AppEvent::DiffResult(text) => {
@@ -2239,6 +2240,18 @@ impl App {
             }
             AppEvent::OpenPermissionsPopup => {
                 self.chat_widget.open_permissions_popup();
+            }
+            AppEvent::SelectTelegramBot { name } => {
+                self.chat_widget.select_telegram_bot(name);
+            }
+            AppEvent::DisableTelegramNotifications => {
+                self.chat_widget.disable_telegram_notifications();
+            }
+            AppEvent::ExternalDecisionInput(input) => {
+                self.chat_widget.handle_external_decision_input(input);
+            }
+            AppEvent::ExternalPromptInput(input) => {
+                self.chat_widget.handle_external_prompt_input(input);
             }
             AppEvent::OpenReviewBranchPicker(cwd) => {
                 self.chat_widget.show_review_branch_picker(&cwd).await;
